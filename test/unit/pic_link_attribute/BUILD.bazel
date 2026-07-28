@@ -1,0 +1,10 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+load(":pic_link_attribute_test.bzl", "pic_link_attribute_test_suite")
+
+cc_library(
+    name = "native_dep",
+    srcs = ["native_dep.c"],
+)
+
+############################ UNIT TESTS #############################
+pic_link_attribute_test_suite(name = "pic_link_attribute_test_suite")

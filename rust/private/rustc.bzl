@@ -507,43 +507,65 @@ def get_linker_and_args(ctx, crate_type, toolchain, cc_toolchain, feature_config
 
     return ld, ld_is_direct_driver, link_args, link_env
 
-def symlink_for_ambiguous_lib(actions, toolchain, crate_info, lib):
-    """Constructs a disambiguating symlink for a library dependency.
+def _canonical_lib_basename(toolchain, lib, path_hash = None):
+    """Computes the canonical file name a library should be linked under.
+
+    Args:
+      toolchain: The Rust toolchain object.
+      lib (File): The library to name.
+      path_hash (int, optional): When set, a disambiguating infix appended to
+        the library name. Required when several distinct libraries would
+        otherwise share the returned name.
+
+    Returns:
+      (str): A `lib<name>.a` (Unix-like) or `<name>.lib` (MSVC) file name.
+    """
+    lib_name = get_lib_name_for_windows(lib) if toolchain.target_abi == "msvc" else get_lib_name_default(lib)
+
+    if toolchain.target_abi == "msvc":
+        prefix = ""
+        extension = ".lib"
+    else:
+        prefix = "lib"
+        extension = ".a"
+
+    # `rules_cc` gives the PIC variant of a static library a `.pic` infix
+    # (`libfoo.pic.a`), which surfaces here as a `.pic` name suffix. Drop it:
+    # the infix is not part of the library's identity, and a name carrying it
+    # satisfies neither a `#[link(name = "foo")]` attribute in the sources nor
+    # a plain `-lfoo` from a dependent crate.
+    if lib_name.endswith(".pic"):
+        lib_name = lib_name[:-len(".pic")]
+
+    if path_hash == None:
+        return "{}{}{}".format(prefix, lib_name, extension)
+    return "{}{}-{}{}".format(prefix, lib_name, path_hash, extension)
+
+def symlink_for_ambiguous_lib(actions, toolchain, crate_info, lib, disambiguate = True):
+    """Constructs a canonically named symlink for a library dependency.
 
     Args:
       actions (Actions): The rule's context actions object.
       toolchain: The Rust toolchain object.
       crate_info (CrateInfo): The target crate's info.
       lib (File): The library to symlink to.
+      disambiguate (bool): Whether to append a hash of the library's path to
+        the symlink name. Necessary when more than one library maps onto the
+        same canonical name, and undesirable otherwise since the hash makes
+        the symlink unresolvable by name.
 
     Returns:
-      (File): The disambiguating symlink for the library.
+      (File): The canonically named symlink for the library.
     """
     # FIXME: Once the relative order part of the native-link-modifiers rustc
     # feature is stable, we should be able to eliminate the need to construct
     # symlinks by passing the full paths to the libraries.
     # https://github.com/rust-lang/rust/issues/81490.
 
-    # Take the absolute value of hash() since it could be negative.
-    path_hash = abs(hash(lib.path))
-    lib_name = get_lib_name_for_windows(lib) if toolchain.target_abi == "msvc" else get_lib_name_default(lib)
-
-    if toolchain.target_abi == "msvc":
-        prefix = ""
-        extension = ".lib"
-    elif lib_name.endswith(".pic"):
-        # Strip the .pic suffix
-        lib_name = lib_name[:-4]
-        prefix = "lib"
-        extension = ".pic.a"
-    else:
-        prefix = "lib"
-        extension = ".a"
-
     # Ensure the symlink follows the lib<name>.a pattern on Unix-like platforms
-    # or <name>.lib on Windows.
-    # Add a hash of the original library path to disambiguate libraries with the same basename.
-    symlink_name = "{}{}-{}{}".format(prefix, lib_name, path_hash, extension)
+    # or <name>.lib on Windows. Take the absolute value of hash() since it
+    # could be negative.
+    symlink_name = _canonical_lib_basename(toolchain, lib, abs(hash(lib.path)) if disambiguate else None)
 
     # Add the symlink to a target crate-specific _ambiguous_libs/ subfolder,
     # to avoid possible collisions with sibling crates that may depend on the
@@ -557,11 +579,18 @@ def symlink_for_ambiguous_lib(actions, toolchain, crate_info, lib):
     return symlink
 
 def _disambiguate_libs(actions, toolchain, crate_info, dep_info, use_pic):
-    """Constructs disambiguating symlinks for ambiguous library dependencies.
+    """Constructs canonically named symlinks for library dependencies that need them.
+
+    A symlink is created whenever the library's file name on disk isn't one the
+    linker resolves from the library's name — either because the name is
+    ambiguous (several distinct libraries share it) or because the file name
+    doesn't follow the platform's `lib<name>.a`/`<name>.lib` convention. The
+    latter covers the PIC variants `rules_cc` produces, which carry a `.pic`
+    infix (`libfoo.pic.a`).
 
     The symlinks are all created in a _ambiguous_libs/ subfolder specific to
     the target crate to avoid possible collisions with sibling crates that may
-    depend on the same ambiguous libraries.
+    depend on the same libraries.
 
     Args:
       actions (Actions): The rule's context actions object.
@@ -571,21 +600,19 @@ def _disambiguate_libs(actions, toolchain, crate_info, dep_info, use_pic):
       use_pic: (boolean): Whether the build should use PIC.
 
     Returns:
-      dict[String, File]: A mapping from ambiguous library paths to their
-        disambiguating symlink.
+      dict[String, File]: A mapping from library short paths to their
+        canonically named symlink.
     """
     # FIXME: Once the relative order part of the native-link-modifiers rustc
     # feature is stable, we should be able to eliminate the need to construct
     # symlinks by passing the full paths to the libraries.
     # https://github.com/rust-lang/rust/issues/81490.
 
-    # A dictionary from file paths of ambiguous libraries to the corresponding
-    # symlink.
-    ambiguous_libs = {}
-
-    # A dictionary maintaining a mapping from preferred library name to the
-    # last visited artifact with that name.
-    visited_libs = {}
+    # Group every static library dependency by the canonical file name it wants
+    # to be linked under, so that ambiguity is known before any symlink is
+    # declared. The inner dict is keyed on `path` so that the same artifact
+    # reached through several linker inputs is only counted once.
+    artifacts_by_canonical_name = {}
     for link_input in dep_info.transitive_noncrates.to_list():
         for lib in link_input.libraries:
             # FIXME: Dynamic libs are not disambiguated right now, there are
@@ -595,43 +622,47 @@ def _disambiguate_libs(actions, toolchain, crate_info, dep_info, use_pic):
             if _is_dylib(lib):
                 continue
             artifact = get_preferred_artifact(lib, use_pic)
-            name = get_lib_name_for_windows(artifact) if toolchain.target_os.startswith("windows") else get_lib_name_default(artifact)
+            canonical_name = _canonical_lib_basename(toolchain, artifact)
+            artifacts_by_canonical_name.setdefault(canonical_name, {})[artifact.path] = artifact
 
+    # A dictionary from short paths of libraries needing a symlink to the
+    # corresponding symlink. Key on `short_path` (root-relative,
+    # configuration-independent) rather than `path` so that the lookup in
+    # `portable_link_flags` keeps matching when path mapping rewrites `.path`
+    # to the `bazel-out/cfg/bin/...` prefix at argv-expansion time.
+    ambiguous_libs = {}
+    for canonical_name, artifacts in artifacts_by_canonical_name.items():
+        # More than one distinct library wants the same canonical name, so the
+        # symlinks have to carry a disambiguating hash. A `#[link]` attribute
+        # naming such a library is unsatisfiable either way.
+        ambiguous = len(artifacts) > 1
+
+        for artifact in artifacts.values():
             # On Linux-like platforms, normally library base names start with
             # `lib`, following the pattern `lib[name].(a|lo)` and we pass
-            # -lstatic=name.
+            # -lstatic=name. PIC variants additionally carry a `.pic` infix
+            # that `-l` can't resolve.
             # On Windows, the base name looks like `name.lib` and we pass
             # -lstatic=name.
             # FIXME: Under the native-link-modifiers unstable rustc feature,
             # we could use -lstatic:+verbatim instead.
             needs_symlink_to_standardize_name = (
                 toolchain.target_os.startswith(("linux", "mac", "darwin")) and
-                artifact.basename.endswith(".a") and not artifact.basename.startswith("lib")
+                artifact.basename.endswith(".a") and artifact.basename != canonical_name
             ) or (
                 toolchain.target_os.startswith("windows") and not artifact.basename.endswith(".lib")
             )
 
-            # Detect cases where we need to disambiguate library dependencies
-            # by constructing symlinks.
-            if (
-                needs_symlink_to_standardize_name or
-                # We have multiple libraries with the same name.
-                (name in visited_libs and visited_libs[name].path != artifact.path)
-            ):
-                # Disambiguate the previously visited library (if we just detected
-                # that it is ambiguous) and the current library. Key the
-                # `ambiguous_libs` dict on `short_path` (root-relative,
-                # configuration-independent) rather than `path` so that the
-                # lookup in `portable_link_flags` keeps matching when path
-                # mapping rewrites `.path` to the `bazel-out/cfg/bin/...`
-                # prefix at argv-expansion time.
-                if name in visited_libs:
-                    old_short_path = visited_libs[name].short_path
-                    if old_short_path not in ambiguous_libs:
-                        ambiguous_libs[old_short_path] = symlink_for_ambiguous_lib(actions, toolchain, crate_info, visited_libs[name])
-                ambiguous_libs[artifact.short_path] = symlink_for_ambiguous_lib(actions, toolchain, crate_info, artifact)
+            if not (ambiguous or needs_symlink_to_standardize_name):
+                continue
 
-            visited_libs[name] = artifact
+            ambiguous_libs[artifact.short_path] = symlink_for_ambiguous_lib(
+                actions,
+                toolchain,
+                crate_info,
+                artifact,
+                disambiguate = ambiguous,
+            )
     return ambiguous_libs
 
 def _depend_on_metadata(crate_info, force_depend_on_objects):

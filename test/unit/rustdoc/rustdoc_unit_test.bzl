@@ -28,8 +28,10 @@ NOT_WINDOWS = select({
 })
 
 def _get_rustdoc_action(env, tut):
-    actions = tut.actions
-    action = actions[0]
+    # Targets with native dependencies also register symlink actions for
+    # libraries whose file name isn't one the linker resolves by name, so the
+    # Rustdoc action isn't necessarily the first one.
+    action = [action for action in tut.actions if action.mnemonic == "Rustdoc"][0]
     assert_action_mnemonic(env, action, "Rustdoc")
 
     return action
@@ -166,13 +168,12 @@ def _rustdoc_with_json_error_format_test_impl(ctx):
 def _rustdoc_test_uses_cc_library_native_lib_test_impl(ctx):
     env = analysistest.begin(ctx)
     tut = analysistest.target_under_test(env)
-    action = tut.actions[0]
+    action = [
+        action
+        for action in tut.actions
+        if action.mnemonic in ["RustdocTestWriter", "RustdocTestCompile"]
+    ][0]
 
-    asserts.true(
-        env,
-        action.mnemonic in ["RustdocTestWriter", "RustdocTestCompile"],
-        "Expected RustdocTestWriter or RustdocTestCompile, got {}".format(action.mnemonic),
-    )
     asserts.true(
         env,
         "-Clink-arg=-lrustdoc_cc_library" in action.argv or "-Clink-arg=-lrustdoc_cc_library.pic" in action.argv,

@@ -15,7 +15,11 @@ load("//test/unit:common.bzl", "assert_action_mnemonic")
 def _native_action_inputs_present_test_impl(ctx):
     env = analysistest.begin(ctx)
     tut = analysistest.target_under_test(env)
-    action = tut.actions[0]
+
+    # Linking targets also register symlink actions for native libraries whose
+    # file name isn't one the linker resolves by name, so the Rustc action
+    # isn't necessarily the first one.
+    action = [action for action in tut.actions if action.mnemonic == "Rustc"][0]
     assert_action_mnemonic(env, action, "Rustc")
     inputs = action.inputs.to_list()
     lib_name = _native_dep_lib_name(ctx)
@@ -34,7 +38,11 @@ def _native_action_inputs_present_test_impl(ctx):
 def _native_action_inputs_not_present_test_impl(ctx):
     env = analysistest.begin(ctx)
     tut = analysistest.target_under_test(env)
-    action = tut.actions[0]
+
+    # Linking targets also register symlink actions for native libraries whose
+    # file name isn't one the linker resolves by name, so the Rustc action
+    # isn't necessarily the first one.
+    action = [action for action in tut.actions if action.mnemonic == "Rustc"][0]
     assert_action_mnemonic(env, action, "Rustc")
     inputs = action.inputs.to_list()
     lib_name = _native_dep_lib_name(ctx)
