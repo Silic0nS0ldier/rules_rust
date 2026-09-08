@@ -15,7 +15,7 @@ use crate::select::Select;
 use crate::utils::sanitize_module_name;
 use crate::utils::starlark::{Glob, Label};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct CrateDependency {
     /// The [CrateId] of the dependency
     pub id: CrateId,
@@ -32,6 +32,67 @@ pub struct CrateDependency {
     /// `[dependencies]` table and the `[patches]` table so they can be used in rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_path: Option<Utf8PathBuf>,
+}
+
+/// Separates the fields of the compact string form of a [`CrateDependency`].
+///
+/// Neither crate names, sanitized target names, semver versions nor aliases can
+/// contain this character.
+pub(crate) const DEPENDENCY_SEPARATOR: char = '|';
+
+/// The `target` a [`CrateDependency`] has unless the crate renames its library.
+pub(crate) fn default_dependency_target(id: &str) -> String {
+    sanitize_module_name(id.rsplit_once(' ').map_or(id, |(name, _version)| name))
+}
+
+impl<'de> Deserialize<'de> for CrateDependency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Dependencies are the most repeated object in a lockfile, so they are
+        // written as `id`, `id|target` or `id|target|alias` strings. See
+        // `crate::lockfile::compact_lockfile_value`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Compact(String),
+            Verbose {
+                id: CrateId,
+                target: String,
+                #[serde(default)]
+                alias: Option<String>,
+                #[serde(default)]
+                local_path: Option<Utf8PathBuf>,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Verbose {
+                id,
+                target,
+                alias,
+                local_path,
+            } => Ok(CrateDependency {
+                id,
+                target,
+                alias,
+                local_path,
+            }),
+            Repr::Compact(compact) => {
+                let mut parts = compact.splitn(3, DEPENDENCY_SEPARATOR);
+                let id = parts.next().expect("splitn always yields one part");
+                let target = parts.next();
+                let alias = parts.next();
+                Ok(CrateDependency {
+                    target: target.map_or_else(|| default_dependency_target(id), str::to_owned),
+                    id: CrateId::deserialize(serde::de::value::StrDeserializer::new(id))?,
+                    alias: alias.map(str::to_owned),
+                    local_path: None,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::config::Config;
+use crate::context::crate_context::{default_dependency_target, DEPENDENCY_SEPARATOR};
 use crate::context::Context;
 use crate::metadata::Cargo;
 use crate::splicing::{SplicingManifest, SplicingMetadata};
@@ -72,6 +73,11 @@ pub(crate) fn write_lockfile(lockfile: Context, path: &Path, dry_run: bool) -> R
 pub(crate) fn compact_lockfile_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
+            if let Some(compacted) = compact_crate_dependency(map) {
+                *value = serde_json::Value::String(compacted);
+                return;
+            }
+
             // Only collapse when the object is exactly `{"common": _, "selects": {}}`.
             // Extra keys (or a missing key) mean this isn't a `Select` and we
             // must leave it alone.
@@ -98,6 +104,41 @@ pub(crate) fn compact_lockfile_value(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// Render a [`crate::context::crate_context::CrateDependency`] object as the
+/// compact string form understood by its `Deserialize` impl, if it is
+/// representable that way.
+///
+/// A dependency is by far the most repeated object in a lockfile, so the
+/// four lines of JSON punctuation per entry dominate the file. `local_path`
+/// has no string representation, so those are left verbose.
+fn compact_crate_dependency(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if map.contains_key("local_path") {
+        return None;
+    }
+
+    let id = map.get("id")?.as_str()?;
+    let target = map.get("target")?.as_str()?;
+    let alias = match map.get("alias") {
+        Some(alias) => Some(alias.as_str()?),
+        None => None,
+    };
+    if map.len() != 2 + usize::from(alias.is_some()) {
+        return None;
+    }
+    if id.contains(DEPENDENCY_SEPARATOR) || target.contains(DEPENDENCY_SEPARATOR) {
+        return None;
+    }
+
+    Some(match alias {
+        Some(alias) if !alias.contains(DEPENDENCY_SEPARATOR) => {
+            format!("{id}{DEPENDENCY_SEPARATOR}{target}{DEPENDENCY_SEPARATOR}{alias}")
+        }
+        Some(_) => return None,
+        None if target == default_dependency_target(id) => id.to_owned(),
+        None => format!("{id}{DEPENDENCY_SEPARATOR}{target}"),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -313,6 +354,8 @@ impl PartialEq<String> for Digest {
 #[cfg(test)]
 mod test {
     use crate::config::{CrateAnnotations, CrateNameAndVersionReq};
+    use crate::context::crate_context::CrateDependency;
+    use crate::select::Select;
     use crate::splicing::cargo_config::{AdditionalRegistry, CargoConfig, Registry};
     use crate::utils::target_triple::TargetTriple;
 
@@ -650,9 +693,9 @@ mod test {
                             "crate_features": ["default", "std"],
                             // Non-empty `selects` preserved as-is.
                             "deps": {
-                                "common": [{"id": "cfg-if 1.0.0", "target": "cfg_if"}],
+                                "common": ["cfg-if 1.0.0"],
                                 "selects": {
-                                    "cfg(windows)": [{"id": "winapi 0.3.9", "target": "winapi"}]
+                                    "cfg(windows)": ["winapi 0.3.9"]
                                 }
                             }
                         }
@@ -660,6 +703,56 @@ mod test {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn compact_writes_dependencies_as_strings() {
+        let mut value = serde_json::json!([
+            // The target matches the sanitized package name, so it is implied.
+            {"id": "cfg-if 1.0.0", "target": "cfg_if"},
+            // A renamed library target has to be spelled out.
+            {"id": "hyper 0.14.22", "target": "hyper_util"},
+            {"id": "rand 0.8.5", "target": "rand", "alias": "rng"},
+            // `local_path` has no string representation.
+            {"id": "local 0.1.0", "target": "local", "local_path": "vendor/local"},
+        ]);
+        compact_lockfile_value(&mut value);
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                "cfg-if 1.0.0",
+                "hyper 0.14.22|hyper_util",
+                "rand 0.8.5|rand|rng",
+                {"id": "local 0.1.0", "target": "local", "local_path": "vendor/local"},
+            ]),
+        );
+    }
+
+    /// The digest is taken before the lockfile is compacted, so compaction must
+    /// round-trip exactly or previously written checksums stop validating.
+    #[test]
+    fn compact_dependencies_round_trip() {
+        let verbose = serde_json::json!({
+            "common": [
+                {"id": "cfg-if 1.0.0", "target": "cfg_if"},
+                {"id": "hyper 0.14.22", "target": "hyper_util"},
+                {"id": "rand 0.8.5", "target": "rand", "alias": "rng"},
+                {"id": "local 0.1.0", "target": "local", "local_path": "vendor/local"},
+            ],
+            "selects": {},
+        });
+
+        let original: Select<BTreeSet<CrateDependency>> =
+            serde_json::from_value(verbose.clone()).unwrap();
+
+        let mut compacted = serde_json::to_value(&original).unwrap();
+        compact_lockfile_value(&mut compacted);
+        assert_ne!(compacted, verbose);
+
+        let round_tripped: Select<BTreeSet<CrateDependency>> =
+            serde_json::from_value(compacted).unwrap();
+        assert_eq!(round_tripped, original);
     }
 
     // Guard against false positives: unrelated `{common, selects}`-shaped objects
