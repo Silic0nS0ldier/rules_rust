@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+# Asserts the shape of the facts recorded in `MODULE.bazel.lock`. This reads the
+# lock file from `BUILD_WORKSPACE_DIRECTORY`, which only `bazel run` sets, and the
+# lock file is only written once a command completes:
+#
+#     bazel build //... && bazel run //:verify_module_lockfile
+rust_binary(
+    name = "verify_module_lockfile",
+    srcs = ["verify_module_lockfile.rs"],
+    edition = "2021",
+    deps = ["@crate_index_facts//:serde_json"],
+)
+
+# Proves the hub and spoke repositories generated from a facts backed lockfile
+# actually produce usable targets.
+rust_test(
+    name = "crates_test",
+    srcs = ["crates_test.rs"],
+    edition = "2021",
+    deps = ["@crate_index_facts//:serde_json"],
+)

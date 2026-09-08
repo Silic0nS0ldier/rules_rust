@@ -15,7 +15,7 @@ use crate::select::Select;
 use crate::utils::sanitize_module_name;
 use crate::utils::starlark::{Glob, Label};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct CrateDependency {
     /// The [CrateId] of the dependency
     pub id: CrateId,
@@ -32,6 +32,67 @@ pub struct CrateDependency {
     /// `[dependencies]` table and the `[patches]` table so they can be used in rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_path: Option<Utf8PathBuf>,
+}
+
+/// Separates the fields of the compact string form of a [`CrateDependency`].
+///
+/// Neither crate names, sanitized target names, semver versions nor aliases can
+/// contain this character.
+pub(crate) const DEPENDENCY_SEPARATOR: char = '|';
+
+/// The `target` a [`CrateDependency`] has unless the crate renames its library.
+pub(crate) fn default_dependency_target(id: &str) -> String {
+    sanitize_module_name(id.rsplit_once(' ').map_or(id, |(name, _version)| name))
+}
+
+impl<'de> Deserialize<'de> for CrateDependency {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Dependencies are the most repeated object in a lockfile, so they are
+        // written as `id`, `id|target` or `id|target|alias` strings. See
+        // `crate::lockfile::compact_lockfile_value`.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Compact(String),
+            Verbose {
+                id: CrateId,
+                target: String,
+                #[serde(default)]
+                alias: Option<String>,
+                #[serde(default)]
+                local_path: Option<Utf8PathBuf>,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Verbose {
+                id,
+                target,
+                alias,
+                local_path,
+            } => Ok(CrateDependency {
+                id,
+                target,
+                alias,
+                local_path,
+            }),
+            Repr::Compact(compact) => {
+                let mut parts = compact.splitn(3, DEPENDENCY_SEPARATOR);
+                let id = parts.next().expect("splitn always yields one part");
+                let target = parts.next();
+                let alias = parts.next();
+                Ok(CrateDependency {
+                    target: target.map_or_else(|| default_dependency_target(id), str::to_owned),
+                    id: CrateId::deserialize(serde::de::value::StrDeserializer::new(id))?,
+                    alias: alias.map(str::to_owned),
+                    local_path: None,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]
@@ -57,7 +118,7 @@ pub(crate) struct TargetAttributes {
     pub(crate) srcs: Glob,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Clone)]
 pub(crate) enum Rule {
     /// `rust_library`
     Library(TargetAttributes),
@@ -70,6 +131,122 @@ pub(crate) enum Rule {
 
     /// `cargo_build_script`
     BuildScript(TargetAttributes),
+}
+
+impl Rule {
+    /// The `crate_root` a target of this kind has unless the crate overrides it.
+    pub(crate) fn conventional_crate_root(kind: &str) -> Option<&'static str> {
+        match kind {
+            "Library" | "ProcMacro" => Some("src/lib.rs"),
+            "Binary" => Some("src/main.rs"),
+            "BuildScript" => Some("build.rs"),
+            _ => None,
+        }
+    }
+
+    /// The `crate_name` a target of this kind has unless it depends on the package name.
+    pub(crate) fn conventional_crate_name(kind: &str) -> Option<&'static str> {
+        match kind {
+            "BuildScript" => Some("build_script_build"),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Rule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A missing `crate_root` means "the conventional one", which is not the
+        // same as an explicit `null`. See `crate::lockfile::compact_lockfile_value`.
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct AttributesRepr {
+            crate_name: String,
+            #[serde(deserialize_with = "deserialize_some")]
+            crate_root: Option<Option<String>>,
+            #[serde(default = "Glob::default_rust_srcs")]
+            srcs: Glob,
+        }
+
+        impl Default for AttributesRepr {
+            fn default() -> Self {
+                Self {
+                    crate_name: String::new(),
+                    crate_root: None,
+                    srcs: Glob::default_rust_srcs(),
+                }
+            }
+        }
+
+        #[derive(Deserialize)]
+        enum Verbose {
+            Library(AttributesRepr),
+            ProcMacro(AttributesRepr),
+            Binary(AttributesRepr),
+            BuildScript(AttributesRepr),
+        }
+
+        // Targets whose attributes are all conventional are written as a bare kind.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Verbose(Verbose),
+            Compact(String),
+        }
+
+        let (kind, repr) = match Repr::deserialize(deserializer)? {
+            Repr::Verbose(Verbose::Library(attrs)) => ("Library", attrs),
+            Repr::Verbose(Verbose::ProcMacro(attrs)) => ("ProcMacro", attrs),
+            Repr::Verbose(Verbose::Binary(attrs)) => ("Binary", attrs),
+            Repr::Verbose(Verbose::BuildScript(attrs)) => ("BuildScript", attrs),
+            Repr::Compact(kind) => match kind.as_str() {
+                "Library" | "ProcMacro" | "Binary" | "BuildScript" => {
+                    let kind = match kind.as_str() {
+                        "Library" => "Library",
+                        "ProcMacro" => "ProcMacro",
+                        "Binary" => "Binary",
+                        _ => "BuildScript",
+                    };
+                    (kind, AttributesRepr::default())
+                }
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown target kind '{other}'"
+                    )))
+                }
+            },
+        };
+
+        let attrs = TargetAttributes {
+            crate_name: if repr.crate_name.is_empty() {
+                Rule::conventional_crate_name(kind).unwrap_or_default().to_owned()
+            } else {
+                repr.crate_name
+            },
+            crate_root: repr
+                .crate_root
+                .unwrap_or_else(|| Rule::conventional_crate_root(kind).map(str::to_owned)),
+            srcs: repr.srcs,
+        };
+
+        Ok(match kind {
+            "Library" => Rule::Library(attrs),
+            "ProcMacro" => Rule::ProcMacro(attrs),
+            "Binary" => Rule::Binary(attrs),
+            _ => Rule::BuildScript(attrs),
+        })
+    }
+}
+
+/// Distinguishes an absent field from one explicitly set to `null`.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl Rule {

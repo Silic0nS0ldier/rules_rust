@@ -724,6 +724,30 @@ tasks:
     test_targets:
       - "//..."
 
+  # --- facts (lockfile persisted in MODULE.bazel.lock via Bazel's facts API) ---
+  # `verify_module_lockfile` reads MODULE.bazel.lock, which is only written once a
+  # command completes, so it has to run as a post shell command.
+  cu_integ_facts_ubuntu2204:
+    name: Crate Universe - facts
+    platform: ubuntu2204
+    working_directory: crate_universe/tests/integration/facts
+    build_targets:
+      - "//..."
+    test_targets:
+      - "//..."
+    post_shell_commands:
+      - bazel run //:verify_module_lockfile
+  cu_integ_facts_macos:
+    name: Crate Universe - facts
+    platform: macos_arm64
+    working_directory: crate_universe/tests/integration/facts
+    build_targets:
+      - "//..."
+    test_targets:
+      - "//..."
+    post_shell_commands:
+      - bazel run //:verify_module_lockfile
+
   # --- external_annotations (linux + macos only, C++ codegen platform issues) ---
   cu_integ_ext_annotations_ubuntu2204:
     name: Crate Universe - external_annotations

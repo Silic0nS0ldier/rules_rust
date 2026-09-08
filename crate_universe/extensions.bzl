@@ -529,6 +529,73 @@ def _collect_splicing_config(module, repository):
 
     return config
 
+# Facts values may not nest more than 7 levels deep, a limit Bazel imposes to keep
+# `MODULE.bazel.lock` human readable and VCS friendly. A whole lockfile needs 9, but a
+# single crate context only needs 6 (7 under the facts root), so each crate is hoisted
+# into its own top-level fact. That also keeps a one-crate change to a one-key diff.
+# Adding a nesting level to `CrateContext` would exceed the limit.
+_CRATE_FACT_TEMPLATE = "{repository}|{crate_id}"
+
+def _lockfile_from_facts(facts, repository):
+    """Reassemble a lockfile from the facts recorded for a repository.
+
+    Args:
+        facts (Facts): The `module_ctx.facts` of the current evaluation.
+        repository (str): The name of the hub repository to reassemble.
+
+    Returns:
+        str: The lockfile contents, or `None` if nothing complete was recorded. Values may
+            have been written by a different version of this extension, so anything
+            unexpected is treated as absent.
+    """
+    entry = facts.get(repository)
+    if type(entry) != "dict":
+        return None
+
+    context = entry.get("context")
+    crate_ids = entry.get("crate_ids")
+    if type(context) != "dict" or type(crate_ids) != "list":
+        return None
+
+    crates = {}
+    for crate_id in crate_ids:
+        crate = facts.get(_CRATE_FACT_TEMPLATE.format(
+            repository = repository,
+            crate_id = crate_id,
+        ))
+        if type(crate) != "dict":
+            return None
+        crates[crate_id] = crate
+
+    context = dict(context)
+    context["crates"] = crates
+    return json.encode(context)
+
+def _lockfile_to_facts(repository, lockfile_contents):
+    """Split a lockfile into the facts to record for a repository.
+
+    Args:
+        repository (str): The name of the hub repository the lockfile belongs to.
+        lockfile_contents (str): The contents of the lockfile.
+
+    Returns:
+        dict: Fact keys mapped to the values to persist.
+    """
+    context = json.decode(lockfile_contents)
+    crates = context.pop("crates")
+
+    facts = {repository: {
+        "context": context,
+        "crate_ids": sorted(crates),
+    }}
+    for crate_id, crate in crates.items():
+        facts[_CRATE_FACT_TEMPLATE.format(
+            repository = repository,
+            crate_id = crate_id,
+        )] = crate
+
+    return facts
+
 def _generate_hub_and_spokes(
         *,
         module_ctx,
@@ -542,6 +609,8 @@ def _generate_hub_and_spokes(
         strip_internal_dependencies_from_cargo_lockfile,
         is_root,
         cargo_lockfile = None,
+        recorded_lockfile = None,
+        record_facts = False,
         manifests = {},
         packages = {}):
     """Generates repositories for the transitive closure of crates defined by manifests and packages.
@@ -569,11 +638,29 @@ def _generate_hub_and_spokes(
             and the producer's lockfile typically lives in a read-only bzlmod cache that can't be
             repinned anyway.
         cargo_lockfile (path): Path to Cargo.lock, if we have one.
+        recorded_lockfile (str): Lockfile contents reassembled from `MODULE.bazel.lock` through
+            Bazel's facts API, if anything was recorded for this repository.
+        record_facts (bool): Whether to return the resulting lockfile for persisting through
+            Bazel's facts API. False when the user manages the lockfile themselves via the
+            `lockfile` attribute, and for non-root modules.
         manifests (dict): The set of Cargo.toml manifests that apply to this closure, if any, keyed by path.
         packages (dict): The set of extra cargo crate tags that apply to this closure, if any, keyed by package name.
+
+    Returns:
+        dict: Fact keys mapped to the values to persist, or `None` if `record_facts` was False.
     """
 
     tag_path = module_ctx.path(cfg.name)
+
+    # Materialize any lockfile recorded in `MODULE.bazel.lock` so the rest of this
+    # function can treat it exactly like a user provided one. The recorded value is
+    # still validated by the digest check in `determine_repin` below, so a stale
+    # entry simply results in a re-pin rather than an incorrect resolution.
+    lockfile_from_facts = False
+    if recorded_lockfile and not lockfile:
+        lockfile = tag_path.get_child("cargo-bazel-lock.json")
+        module_ctx.file(lockfile, recorded_lockfile, executable = False)
+        lockfile_from_facts = True
 
     config_file = tag_path.get_child("config.json")
     module_ctx.file(
@@ -631,6 +718,10 @@ def _generate_hub_and_spokes(
             lockfile_path = lockfile,
             config = config_file,
             splicing_manifest = splicing_manifest,
+            # A lockfile recorded in `MODULE.bazel.lock` is not user managed, so
+            # there is nothing for `CARGO_BAZEL_REPIN` to update. Silently refresh
+            # it instead of failing.
+            auto_repin = lockfile_from_facts,
         )
 
     # The workspace root when one is explicitly provided.
@@ -673,6 +764,12 @@ def _generate_hub_and_spokes(
             # We can only watch paths in our workspace.
             if path_to_track.startswith(str(nonhermetic_root_bazel_workspace_dir)):
                 module_ctx.watch(path_to_track)
+
+    # `cargo-bazel generate` requires `--cargo-lockfile` unconditionally but never
+    # reads it when rendering from an existing lockfile.
+    if cargo_lockfile == None:
+        cargo_lockfile = tag_path.get_child("Cargo.lock")
+        module_ctx.file(cargo_lockfile, "")
 
     paths_to_track_file = tag_path.get_child("paths_to_track.json")
     warnings_output_file = tag_path.get_child("warnings_output.json")
@@ -729,7 +826,8 @@ def _generate_hub_and_spokes(
         contents = hub_contents,
     )
 
-    contents = json.decode(module_ctx.read(lockfile))
+    lockfile_contents = module_ctx.read(lockfile)
+    contents = json.decode(lockfile_contents)
 
     for crate in contents["crates"].values():
         repo = crate["repository"]
@@ -801,6 +899,11 @@ def _generate_hub_and_spokes(
             )
         else:
             fail("Invalid repo: expected Http or Git to exist for crate %s-%s, got %s" % (name, version, repo))
+
+    if not record_facts:
+        return None
+
+    return _lockfile_to_facts(cfg.name, lockfile_contents)
 
 def _package_to_json(p):
     # Avoid adding unspecified properties.
@@ -988,6 +1091,15 @@ def _filter_dict(dict):
 
 def _crate_impl(module_ctx):
     reproducible = True
+
+    # Bazel 8.5.0+ can persist arbitrary data for a module extension in
+    # `MODULE.bazel.lock` without forcing the extension to be non-reproducible.
+    # This is used to store the crate_universe lockfile for tags that don't
+    # provide one, which keeps the (very large) generated `BUILD` file contents
+    # out of `MODULE.bazel.lock`.
+    facts_supported = hasattr(module_ctx, "facts")
+    new_facts = {}
+
     host_triple = get_host_triple(module_ctx, abi = {
         "aarch64-unknown-linux": "musl",
         "x86_64-unknown-linux": "musl",
@@ -1174,15 +1286,22 @@ def _crate_impl(module_ctx):
             )
 
             lockfile_path = None
+            recorded_lockfile = None
+            record_facts = False
             if cfg.lockfile:
                 lockfile_path = module_ctx.path(cfg.lockfile)
+            elif facts_supported and mod.is_root:
+                # Deliberately root-only: a transitive module must ship its own lockfile so its
+                # crate versions don't shift from one consumer to the next.
+                record_facts = True
+                recorded_lockfile = _lockfile_from_facts(module_ctx.facts, cfg.name)
             else:
                 reproducible = False
 
             cargo_lockfile = None
             if cfg.cargo_lockfile:
                 cargo_lockfile = module_ctx.path(cfg.cargo_lockfile)
-            else:
+            elif not record_facts:
                 reproducible = False
 
             manifests = {}
@@ -1197,13 +1316,15 @@ def _crate_impl(module_ctx):
                 for p in common_specs + repo_specific_specs.get(cfg.name, [])
             }
 
-            _generate_hub_and_spokes(
+            recorded_lockfile_facts = _generate_hub_and_spokes(
                 module_ctx = module_ctx,
                 cargo_bazel_fn = cargo_bazel_fn,
                 cfg = cfg,
                 annotations = annotations,
                 lockfile = lockfile_path,
                 cargo_lockfile = cargo_lockfile,
+                recorded_lockfile = recorded_lockfile,
+                record_facts = record_facts,
                 render_config = rendering_config,
                 splicing_config = splicing_config,
                 manifests = manifests,
@@ -1212,6 +1333,8 @@ def _crate_impl(module_ctx):
                 strip_internal_dependencies_from_cargo_lockfile = cfg.strip_internal_dependencies_from_cargo_lockfile,
                 is_root = mod.is_root,
             )
+            if recorded_lockfile_facts != None:
+                new_facts.update(recorded_lockfile_facts)
 
             # Watch cfg.lockfile AFTER generation. The generator may modify it during
             # repin, and in Bazel 9 module_ctx.read verifies digests for files already
@@ -1222,6 +1345,8 @@ def _crate_impl(module_ctx):
     metadata_kwargs = {}
     if bazel_features.external_deps.extension_metadata_has_reproducible:
         metadata_kwargs["reproducible"] = reproducible
+    if facts_supported:
+        metadata_kwargs["facts"] = new_facts
 
     return module_ctx.extension_metadata(**metadata_kwargs)
 
@@ -1247,7 +1372,10 @@ _FROM_COMMON_ATTRS = {
     "lockfile": attr.label(
         doc = (
             "The path to a file to use for reproducible renderings. " +
-            "If set, this file must exist within the workspace (but can be empty) before this rule will work."
+            "If set, this file must exist within the workspace (but can be empty) before this rule will work. " +
+            "When unset in the root module, and the version of Bazel in use supports it, the lockfile is " +
+            "instead persisted in `MODULE.bazel.lock` using Bazel's facts API. Non-root modules must always " +
+            "set this."
         ),
     ),
     "skip_cargo_lockfile_overwrite": attr.bool(
@@ -1654,6 +1782,10 @@ _annotation_select = tag_class(
     } | _ANNOTATION_SELECT_ATTRS,
 )
 
+# Bump this whenever the schema of the dict returned by `_generate_hub_and_spokes`
+# changes incompatibly so Bazel discards facts written by an older version.
+_CRATE_EXTENSION_KWARGS = {"facts_version": 1} if bazel_features.external_deps.has_facts else {}
+
 crate = module_extension(
     doc = """\
 Crate universe module extensions.
@@ -1681,4 +1813,5 @@ Environment Variables:
         "splicing_config": _splicing_config,
     },
     environ = CRATES_REPOSITORY_ENVIRON,
+    **_CRATE_EXTENSION_KWARGS
 )
