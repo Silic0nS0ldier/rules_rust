@@ -118,7 +118,7 @@ pub(crate) struct TargetAttributes {
     pub(crate) srcs: Glob,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Clone)]
 pub(crate) enum Rule {
     /// `rust_library`
     Library(TargetAttributes),
@@ -131,6 +131,122 @@ pub(crate) enum Rule {
 
     /// `cargo_build_script`
     BuildScript(TargetAttributes),
+}
+
+impl Rule {
+    /// The `crate_root` a target of this kind has unless the crate overrides it.
+    pub(crate) fn conventional_crate_root(kind: &str) -> Option<&'static str> {
+        match kind {
+            "Library" | "ProcMacro" => Some("src/lib.rs"),
+            "Binary" => Some("src/main.rs"),
+            "BuildScript" => Some("build.rs"),
+            _ => None,
+        }
+    }
+
+    /// The `crate_name` a target of this kind has unless it depends on the package name.
+    pub(crate) fn conventional_crate_name(kind: &str) -> Option<&'static str> {
+        match kind {
+            "BuildScript" => Some("build_script_build"),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Rule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A missing `crate_root` means "the conventional one", which is not the
+        // same as an explicit `null`. See `crate::lockfile::compact_lockfile_value`.
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct AttributesRepr {
+            crate_name: String,
+            #[serde(deserialize_with = "deserialize_some")]
+            crate_root: Option<Option<String>>,
+            #[serde(default = "Glob::default_rust_srcs")]
+            srcs: Glob,
+        }
+
+        impl Default for AttributesRepr {
+            fn default() -> Self {
+                Self {
+                    crate_name: String::new(),
+                    crate_root: None,
+                    srcs: Glob::default_rust_srcs(),
+                }
+            }
+        }
+
+        #[derive(Deserialize)]
+        enum Verbose {
+            Library(AttributesRepr),
+            ProcMacro(AttributesRepr),
+            Binary(AttributesRepr),
+            BuildScript(AttributesRepr),
+        }
+
+        // Targets whose attributes are all conventional are written as a bare kind.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Verbose(Verbose),
+            Compact(String),
+        }
+
+        let (kind, repr) = match Repr::deserialize(deserializer)? {
+            Repr::Verbose(Verbose::Library(attrs)) => ("Library", attrs),
+            Repr::Verbose(Verbose::ProcMacro(attrs)) => ("ProcMacro", attrs),
+            Repr::Verbose(Verbose::Binary(attrs)) => ("Binary", attrs),
+            Repr::Verbose(Verbose::BuildScript(attrs)) => ("BuildScript", attrs),
+            Repr::Compact(kind) => match kind.as_str() {
+                "Library" | "ProcMacro" | "Binary" | "BuildScript" => {
+                    let kind = match kind.as_str() {
+                        "Library" => "Library",
+                        "ProcMacro" => "ProcMacro",
+                        "Binary" => "Binary",
+                        _ => "BuildScript",
+                    };
+                    (kind, AttributesRepr::default())
+                }
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unknown target kind '{other}'"
+                    )))
+                }
+            },
+        };
+
+        let attrs = TargetAttributes {
+            crate_name: if repr.crate_name.is_empty() {
+                Rule::conventional_crate_name(kind).unwrap_or_default().to_owned()
+            } else {
+                repr.crate_name
+            },
+            crate_root: repr
+                .crate_root
+                .unwrap_or_else(|| Rule::conventional_crate_root(kind).map(str::to_owned)),
+            srcs: repr.srcs,
+        };
+
+        Ok(match kind {
+            "Library" => Rule::Library(attrs),
+            "ProcMacro" => Rule::ProcMacro(attrs),
+            "Binary" => Rule::Binary(attrs),
+            _ => Rule::BuildScript(attrs),
+        })
+    }
+}
+
+/// Distinguishes an absent field from one explicitly set to `null`.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl Rule {

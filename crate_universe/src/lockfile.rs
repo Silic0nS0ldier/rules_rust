@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::config::Config;
-use crate::context::crate_context::{default_dependency_target, DEPENDENCY_SEPARATOR};
+use crate::context::crate_context::{default_dependency_target, Rule, DEPENDENCY_SEPARATOR};
 use crate::context::Context;
 use crate::metadata::Cargo;
 use crate::splicing::{SplicingManifest, SplicingMetadata};
@@ -75,6 +75,10 @@ pub(crate) fn compact_lockfile_value(value: &mut serde_json::Value) {
         serde_json::Value::Object(map) => {
             if let Some(compacted) = compact_crate_dependency(map) {
                 *value = serde_json::Value::String(compacted);
+                return;
+            }
+            if let Some(compacted) = compact_rule(map) {
+                *value = compacted;
                 return;
             }
 
@@ -139,6 +143,39 @@ fn compact_crate_dependency(map: &serde_json::Map<String, serde_json::Value>) ->
         None if target == default_dependency_target(id) => id.to_owned(),
         None => format!("{id}{DEPENDENCY_SEPARATOR}{target}"),
     })
+}
+
+/// Drop the [`crate::context::crate_context::Rule`] attributes that its
+/// `Deserialize` impl restores from the target kind alone, collapsing the whole
+/// target to a bare kind when nothing else is left.
+fn compact_rule(map: &serde_json::Map<String, serde_json::Value>) -> Option<serde_json::Value> {
+    if map.len() != 1 {
+        return None;
+    }
+    let (kind, attrs) = map.iter().next()?;
+    let conventional_root = Rule::conventional_crate_root(kind)?;
+    let attrs = attrs.as_object()?;
+    if !attrs.keys().all(|k| matches!(k.as_str(), "crate_name" | "crate_root" | "srcs")) {
+        return None;
+    }
+
+    let mut compacted = attrs.clone();
+    if compacted.get("crate_root").and_then(|r| r.as_str()) == Some(conventional_root) {
+        compacted.remove("crate_root");
+    }
+    if compacted.get("crate_name").and_then(|n| n.as_str())
+        == Rule::conventional_crate_name(kind)
+    {
+        compacted.remove("crate_name");
+    }
+
+    if compacted.is_empty() {
+        return Some(serde_json::Value::String(kind.clone()));
+    }
+    if compacted.len() == attrs.len() {
+        return None;
+    }
+    Some(serde_json::json!({ kind.clone(): compacted }))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -752,6 +789,48 @@ mod test {
 
         let round_tripped: Select<BTreeSet<CrateDependency>> =
             serde_json::from_value(compacted).unwrap();
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn compact_writes_conventional_targets_as_kinds() {
+        let mut value = serde_json::json!([
+            // Everything about a conventional build script is implied by its kind.
+            {"BuildScript": {"crate_name": "build_script_build", "crate_root": "build.rs"}},
+            // A library still has to name itself after its package.
+            {"Library": {"crate_name": "aho_corasick", "crate_root": "src/lib.rs"}},
+            // Anything unconventional is left alone.
+            {"Library": {"crate_name": "serde", "crate_root": "lib/serde.rs"}},
+        ]);
+        compact_lockfile_value(&mut value);
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                "BuildScript",
+                {"Library": {"crate_name": "aho_corasick"}},
+                {"Library": {"crate_name": "serde", "crate_root": "lib/serde.rs"}},
+            ]),
+        );
+    }
+
+    #[test]
+    fn compact_targets_round_trip() {
+        // `srcs` is absent whenever it is the default glob, and an explicit null
+        // `crate_root` must not be confused with an omitted one.
+        let verbose = serde_json::json!([
+            {"BuildScript": {"crate_name": "build_script_build", "crate_root": "build.rs"}},
+            {"Library": {"crate_name": "aho_corasick", "crate_root": "src/lib.rs"}},
+            {"Binary": {"crate_name": "cli", "crate_root": null}},
+        ]);
+
+        let original: BTreeSet<Rule> = serde_json::from_value(verbose.clone()).unwrap();
+
+        let mut compacted = serde_json::to_value(&original).unwrap();
+        compact_lockfile_value(&mut compacted);
+        assert_ne!(compacted, verbose);
+
+        let round_tripped: BTreeSet<Rule> = serde_json::from_value(compacted).unwrap();
         assert_eq!(round_tripped, original);
     }
 
