@@ -370,7 +370,8 @@ def determine_repin(
         lockfile_path,
         config,
         splicing_manifest,
-        repin_instructions = None):
+        repin_instructions = None,
+        auto_repin = False):
     """Use the `cargo-bazel` binary to determine whether or not dependencies need to be re-pinned
 
     Args:
@@ -381,6 +382,9 @@ def determine_repin(
         splicing_manifest (path): The path to a `cargo-bazel` splicing manifest. See `create_splicing_manifest`
         lockfile_path (path): The path to a "lock" file for reproducible outputs.
         repin_instructions (optional string): Instructions to re-pin dependencies in your repository. Will be shown when re-pinning is required.
+        auto_repin (bool): If True, an out of date lockfile silently triggers a re-pin instead of failing.
+            This is only appropriate when the lockfile is not user managed and therefore cannot be
+            updated by an explicit `CARGO_BAZEL_REPIN` invocation.
 
     Returns:
         bool: True if dependencies need to be re-pinned
@@ -419,6 +423,8 @@ def determine_repin(
     # flag indicating repinning was requested, an error is raised
     # since repinning should be an explicit action
     if result.return_code:
+        if auto_repin:
+            return True
         if repin_instructions:
             msg = ("\n".join([
                 result.stderr,
